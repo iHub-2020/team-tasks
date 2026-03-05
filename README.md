@@ -7,7 +7,7 @@ A Python CLI tool for coordinating multi-agent development workflows through sha
 Three coordination modes for different workflows:
 
 | Mode | Description | Use Case |
-|------|-------------|----------|
+| --- | --- | --- |
 | **Linear** | Sequential pipeline with auto-advance | Bug fixes, simple features, step-by-step workflows |
 | **DAG** | Dependency graph with parallel dispatch | Large features, spec-driven dev, complex dependencies |
 | **Debate** | Multi-agent position + cross-review | Code reviews, architecture decisions, competing hypotheses |
@@ -15,7 +15,8 @@ Three coordination modes for different workflows:
 ## Requirements
 
 - Python 3.12+ (stdlib only, no external dependencies)
-- Data stored as JSON in `/home/ubuntu/clawd/data/team-tasks/` (override with `TEAM_TASKS_DIR` env var)
+- Data stored as JSON in `~/.openclaw/data/team-tasks/` (default)
+- Override with `TEAM_TASKS_DIR` env var, or configure via `openclaw.json` (see [Data Storage](#data-storage))
 
 ## Installation
 
@@ -28,9 +29,17 @@ python3 team-tasks/scripts/task_manager.py --help
 ```
 
 For OpenClaw skill integration, copy to your skills directory:
+
 ```bash
-cp -r team-tasks/ /path/to/clawd/skills/team-tasks/
+# Shared skills (available to all agents on this machine)
+cp -r team-tasks/ ~/.openclaw/skills/team-tasks/
+
+# Or: workspace-local skill (highest precedence, one workspace only)
+cp -r team-tasks/ /path/to/your/workspace/skills/team-tasks/
 ```
+
+> **Skill precedence** (highest → lowest): `<workspace>/skills` → `~/.openclaw/skills` → bundled skills.
+> See [OpenClaw Skills docs](https://docs.openclaw.ai/tools/skills) for details.
 
 ## Quick Start
 
@@ -67,6 +76,7 @@ $TM status my-api
 ```
 
 **Output example:**
+
 ```
 📋 Project: my-api
 🎯 Goal: Build REST API with tests and docs
@@ -108,6 +118,7 @@ $TM graph my-feature
 ```
 
 **Graph output:**
+
 ```
 📋 my-feature — DAG Graph
 
@@ -142,6 +153,7 @@ $TM ready my-feature  # Shows newly unblocked tasks
 ```
 
 **Key DAG features:**
+
 - `ready` returns ALL tasks whose deps are satisfied — dispatch them simultaneously
 - `ready --json` includes `depOutputs` — previous stage results to pass to agents
 - Automatic unblock notifications when a task completes
@@ -159,7 +171,7 @@ TM="python3 scripts/task_manager.py"
 $TM init security-review --mode debate \
   -g "Review auth module for security vulnerabilities"
 
-# 2. Add debaters with roles/perspectives
+# 2. Add debaters with roles/perspectives (ALL before round start)
 $TM add-debater security-review code-agent  --role "security expert focused on injection attacks"
 $TM add-debater security-review test-agent  --role "QA engineer focused on edge cases"
 $TM add-debater security-review monitor-bot --role "ops engineer focused on deployment risks"
@@ -167,7 +179,6 @@ $TM add-debater security-review monitor-bot --role "ops engineer focused on depl
 # 3. Start initial round
 $TM round security-review start
 # 🗣️  Debate Round 1 (initial) started
-# Outputs dispatch prompts for each debater
 
 # 4. Collect initial positions
 $TM round security-review collect code-agent  "Found SQL injection in login()"
@@ -178,7 +189,6 @@ $TM round security-review collect monitor-bot "No rate limiting on auth endpoint
 
 # 5. Generate cross-review prompts
 $TM round security-review cross-review
-# 🔁 Each debater gets others' positions + review instructions
 
 # 6. Collect cross-reviews
 $TM round security-review collect code-agent  "Agree on validation. Rate limiting is critical."
@@ -191,6 +201,7 @@ $TM round security-review synthesize
 ```
 
 **Debate workflow diagram:**
+
 ```
 Question → [Agent A] → Position A ─┐
          → [Agent B] → Position B ─┤── Cross-Review ── Synthesis
@@ -202,7 +213,7 @@ Question → [Agent A] → Position A ─┐
 ### All Commands
 
 | Command | Mode | Usage | Description |
-|---------|------|-------|-------------|
+| --- | --- | --- | --- |
 | `init` | all | `init <project> -g "goal" [-m linear\|dag\|debate]` | Create project |
 | `add` | dag | `add <project> <task-id> -a <agent> -d <deps>` | Add task with deps |
 | `add-debater` | debate | `add-debater <project> <agent-id> [-r "role"]` | Add debater |
@@ -222,7 +233,7 @@ Question → [Agent A] → Position A ─┐
 ### Status Values
 
 | Status | Icon | Meaning |
-|--------|------|---------|
+| --- | --- | --- |
 | `pending` | ⬜ | Waiting for dispatch |
 | `in-progress` | 🔄 | Agent is working |
 | `done` | ✅ | Completed |
@@ -242,9 +253,13 @@ python3 scripts/task_manager.py init <project> \
 
 ## Integration with OpenClaw
 
-This tool is designed as an [OpenClaw Skill](https://docs.openclaw.ai). The orchestrating agent (AGI) dispatches tasks to worker agents via `sessions_send` and tracks state through the CLI.
+This tool is designed as an [OpenClaw Skill](https://docs.openclaw.ai/tools/skills). The orchestrating agent (AGI) dispatches tasks to worker agents via `sessions_send` and tracks state through the CLI.
+
+> **Prerequisite:** `sessions_send` must be in your orchestrating agent's `tools.allow` list in `openclaw.json`.
+> See SKILL.md for the full configuration example.
 
 **Dispatch loop (linear):**
+
 ```
 1. next <project> --json           → get next stage info
 2. update <project> <agent> in-progress
@@ -256,6 +271,7 @@ This tool is designed as an [OpenClaw Skill](https://docs.openclaw.ai). The orch
 ```
 
 **Dispatch loop (DAG):**
+
 ```
 1. ready <project> --json          → get ALL dispatchable tasks
 2. For each ready task (parallel):
@@ -303,14 +319,36 @@ $TM round my-debate start
 
 ## Data Storage
 
-Project files are stored as JSON at:
+Project files are stored as JSON. Path resolution order:
+
+1. `TEAM_TASKS_DIR` environment variable (if set)
+2. Default: `~/.openclaw/data/team-tasks/`
+
 ```
-/home/ubuntu/clawd/data/team-tasks/<project>.json
+~/.openclaw/data/team-tasks/<project>.json
 ```
 
-Override with environment variable:
+### Setting a custom path via `openclaw.json`
+
+```json
+{
+  "skills": {
+    "entries": {
+      "team-tasks": {
+        "enabled": true,
+        "env": {
+          "TEAM_TASKS_DIR": "/custom/path/team-tasks"
+        }
+      }
+    }
+  }
+}
+```
+
+Or set it in your shell session:
+
 ```bash
-export TEAM_TASKS_DIR=/custom/path
+export TEAM_TASKS_DIR=/custom/path/team-tasks
 ```
 
 ## Project Structure
