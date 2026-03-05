@@ -29,9 +29,15 @@ import json
 import os
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 DEFAULT_PIPELINE = ["code-agent", "test-agent", "docs-agent", "monitor-bot"]
-TASKS_DIR = os.environ.get("TEAM_TASKS_DIR", "/home/ubuntu/clawd/data/team-tasks")
+
+# Resolve data directory:
+# 1. Honour TEAM_TASKS_DIR env var if set (e.g. via openclaw.json skills.entries.team-tasks.env)
+# 2. Fall back to ~/.openclaw/data/team-tasks  (works for any user on any OS)
+_default_tasks_dir = Path.home() / ".openclaw" / "data" / "team-tasks"
+TASKS_DIR = os.environ.get("TEAM_TASKS_DIR", str(_default_tasks_dir))
 
 
 def now_iso():
