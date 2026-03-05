@@ -2,7 +2,7 @@
 name: team-tasks
 description: Multi-agent pipeline coordination with Linear, DAG, and Debate modes. Use to orchestrate sequential pipelines, parallel dependency graphs, or multi-agent deliberation workflows via a shared JSON task store.
 user-invocable: false
-metadata: {"openclaw":{"requires":{"bins":["python3"],"config":["tools.sessions.visibility"]},"emoji":"🗂️","os":["linux","darwin"]}}
+metadata: {"openclaw":{"requires":{"bins":["python3"]},"emoji":"🗂️","os":["linux","darwin"]}}
 ---
 
 # Team Tasks — Multi-Agent Pipeline Coordination
@@ -13,24 +13,44 @@ This skill coordinates multi-agent development workflows through shared JSON tas
 The CLI tool lives at: `{baseDir}/scripts/task_manager.py`
 
 **AGI is the command center.** Worker agents do not communicate directly with each other.
-All state is shared via JSON files. AGI dispatches via `sessions_send`, tracks state via this CLI.
+All state is shared via JSON files. AGI dispatches via `sessions_send` (Linear) or `sessions_spawn` (DAG parallel), tracks state via this CLI.
 
 ### ⚙️ Prerequisites (verify before use)
 
 1. **Python 3.12+** must be on PATH — the `metadata.requires.bins` gate checks for `python3`.
-2. **sessions_send** must be enabled in your `openclaw.json` for the orchestrating agent:
+2. **Three OpenClaw config keys required** — all three must be set or cross-agent dispatch silently fails:
+
    ```json
    {
      "agents": {
        "list": [{
-         "id": "your-agent-id",
+         "id": "your-orchestrator-agent",
+         "subagents": {
+           "allowAgents": ["code-agent", "test-agent", "docs-agent", "monitor-bot"]
+         },
          "tools": {
-           "allow": ["sessions_send", "sessions_list", "sessions_history", "session_status", "exec", "read"]
+           "sessions": { "visibility": "agent" },
+           "allow": [
+             "exec", "read",
+             "sessions_list", "sessions_history",
+             "sessions_send", "sessions_spawn", "session_status"
+           ]
          }
        }]
+     },
+     "tools": {
+       "agentToAgent": {
+         "enabled": true,
+         "allow": ["code-agent", "test-agent", "docs-agent", "monitor-bot"]
+       }
      }
    }
    ```
+
+   - `tools.agentToAgent` — default `enabled: false`; without this, `sessions_send` to another agent is silently blocked.
+   - `tools.sessions.visibility` — default `"tree"` (only spawned subagents visible); set to `"agent"` to see independently configured worker agents.
+   - `subagents.allowAgents` — required for `sessions_spawn` to target other agents; default allows same agent only.
+
 3. **Data directory** is controlled by env var `TEAM_TASKS_DIR`.
    Default when unset: `~/.openclaw/data/team-tasks/`
    Override in your `openclaw.json`:
@@ -159,15 +179,19 @@ $TM graph my-feature
 READY=$($TM ready my-feature --json)
 # → [{ "id": "design", "agent": "docs-agent" }, { "id": "scaffold", "agent": "code-agent" }]
 
-# 2. For EACH ready task — dispatch in parallel
+# 2. For EACH ready task — dispatch in parallel via sessions_spawn (non-blocking)
 for task in $READY:
   $TM update my-feature <task.id> in-progress
-  sessions_send(sessionKey="agent:<task.agent>:main",
-                message="Task: <task.desc>\nPrior outputs: <task.depOutputs>",
-                timeoutSeconds=180)
+  sessions_spawn(
+    task="Task: <task.desc>\nPrior outputs: <task.depOutputs>",
+    agentId="<task.agent>",
+    label="<task.id>",
+    runTimeoutSeconds=600
+  )
+  # → returns immediately: { status: "accepted", runId, childSessionKey }
 
-# 3. On each agent reply:
-$TM result my-feature <task.id> "<agent reply>"
+# 3. On each agent announce (result arrives asynchronously):
+$TM result my-feature <task.id> "<agent announce result>"
 $TM update my-feature <task.id> done
 # 🟢 Unblocked: <newly-unblocked tasks> ← check stdout
 
@@ -291,9 +315,13 @@ $TM add-debater my-debate agent-b
 $TM round my-debate start
 ```
 
-### ❌ sessions_send not in tools.allow
-If dispatching to worker agents silently fails, confirm `sessions_send` is in your agent's
-`tools.allow` list in `openclaw.json`. See Prerequisites above.
+### ❌ Cross-agent dispatch silently fails
+Three config keys must all be set. Missing any one causes silent failure with no error message:
+- `tools.agentToAgent.enabled: true` + `allow` list
+- `tools.sessions.visibility: "agent"` (default `"tree"` cannot see independent worker agents)
+- `subagents.allowAgents` (required for `sessions_spawn` to target other agents)
+
+See Prerequisites section for the complete `openclaw.json` example.
 
 ---
 
