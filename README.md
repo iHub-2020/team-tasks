@@ -253,31 +253,38 @@ python3 scripts/task_manager.py init <project> \
 
 ## Integration with OpenClaw
 
-This tool is designed as an [OpenClaw Skill](https://docs.openclaw.ai/tools/skills). The orchestrating agent (AGI) dispatches tasks to worker agents via `sessions_send` and tracks state through the CLI.
+This tool is designed as an [OpenClaw Skill](https://docs.openclaw.ai/tools/skills). The orchestrating agent (AGI) dispatches tasks to worker agents via `sessions_send` (Linear) or `sessions_spawn` (DAG), and tracks state through the CLI.
 
-> **Prerequisite:** `sessions_send` must be in your orchestrating agent's `tools.allow` list in `openclaw.json`.
-> See SKILL.md for the full configuration example.
+> **Three config keys required** — all must be set in `openclaw.json` or cross-agent dispatch silently fails:
+> - `tools.agentToAgent.enabled: true` + agent allowlist
+> - `tools.sessions.visibility: "agent"` (default `"tree"` cannot see independent worker agents)
+> - `agents.list[].subagents.allowAgents` (required for `sessions_spawn` to target other agents)
+>
+> See `docs/AGENT_TEAMS_OFFICIAL_DOCS.md` for the complete configuration reference.
 
-**Dispatch loop (linear):**
+**Dispatch loop (linear)** — uses `sessions_send` (blocking, wait for reply):
 
 ```
-1. next <project> --json           → get next stage info
+1. next <project> --json              → get next stage info
 2. update <project> <agent> in-progress
-3. sessions_send(agent, task)      → dispatch to agent
+3. sessions_send(sessionKey="agent:<agent>:main", message=task, timeoutSeconds=300)
 4. Wait for agent reply
-5. result <project> <agent> "..."  → save output
-6. update <project> <agent> done   → auto-advances to next stage
+5. result <project> <agent> "..."     → save output
+6. update <project> <agent> done      → auto-advances to next stage
 7. Repeat
 ```
 
-**Dispatch loop (DAG):**
+**Dispatch loop (DAG)** — uses `sessions_spawn` (non-blocking, parallel):
 
 ```
-1. ready <project> --json          → get ALL dispatchable tasks
+1. ready <project> --json             → get ALL dispatchable tasks
 2. For each ready task (parallel):
    a. update <project> <task> in-progress
-   b. sessions_send(agent, task + depOutputs)
-3. On reply: result → update done → check newly unblocked
+   b. sessions_spawn(task=desc+depOutputs, agentId=agent, label=taskId)
+      → returns immediately: { status: "accepted", runId, childSessionKey }
+3. On each agent announce (async):
+   result <project> <task> "..."      → save output
+   update <project> <task> done       → check newly unblocked
 4. Repeat until all tasks complete
 ```
 
