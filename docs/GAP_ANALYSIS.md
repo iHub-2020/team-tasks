@@ -1,50 +1,171 @@
-# Gap Analysis: `team-tasks` vs Official Claude Code Agent Teams
+# GAP Analysis: team-tasks vs Claude Code Agent Teams
 
-Date: 2026-02-08
+> Last updated: 2026-03  
+> OpenClaw docs reference: https://docs.openclaw.ai  
+> Claude Code docs reference: https://docs.anthropic.com/en/docs/claude-code/agent-teams
 
-## Scope
-Compared these files:
-- `AGENT_TEAMS_OFFICIAL_DOCS.md`
-- `SKILL.md`
-- `scripts/task_manager.py`
-- `SPEC.md`
+---
 
-This analysis compares our current implementation to official Claude Code Agent Teams behavior, not just to our internal spec.
+## Background
 
-## Summary Table
-| Capability | Official Claude Code Agent Teams | Current `team-tasks` | Gap | Assessment |
-|---|---|---|---|---|
-| Team model (lead + teammates as managed instances) | Built-in team lead + spawned teammates with independent contexts | No native team object or spawn lifecycle in `task_manager.py`; project JSON tracks tasks/debaters only | High | We have a task tracker, not a full team runtime |
-| Direct teammate communication (`message`, `broadcast`, mailbox) | Teammates can message each other directly | `SKILL.md` explicitly states centralized orchestration: "agents never talk to each other directly" | High | Core architectural mismatch |
-| Shared task list with self-claim | Teammates self-claim or are assigned; shared list for all agents | Lead/dispatcher updates statuses; no claim command for teammates | High | Centralized control only |
-| Race-safe task claiming (file locking) | Explicit locking for claim operations | No locking primitives or claim workflow in script | High | Concurrency safety missing for multi-writer use |
-| Dependency handling / unblock | Dependencies and automatic unblock | Implemented via DAG `dependsOn` + `ready` + unblocked notifications (`compute_ready_tasks`, `cmd_update`) | Low | Strong match |
-| Task state lifecycle | `pending`, `in progress`, `completed` | `pending`, `in-progress`, `done`, plus `failed`, `skipped` | Low | Equivalent + extensions |
-| Delegate mode (lead restricted to orchestration tools) | Supported | Not implemented | High | No guardrails for lead behavior |
-| Plan approval workflow | Teammates can be forced to submit plans for approval | Not implemented | High | Missing governance loop |
-| Quality gates / hooks (`TeammateIdle`, `TaskCompleted`) | Supported with blocking feedback | Not implemented | High | Missing policy enforcement points |
-| Display modes (in-process, split panes) | Supported | Not implemented in this tool | Medium | Mostly UX/runtime gap |
-| Data model for teams | Team config + members persisted in `~/.claude/teams` and task list in `~/.claude/tasks` | Project JSON only (`/home/ubuntu/clawd/data/team-tasks/*.json`) | Medium | Simpler model; lacks team/member metadata |
-| Project context propagation | Teammates load same project context automatically | Workspace path is manually stored and surfaced via `--workspace`, `next`, `ready` | Medium | Useful, but not full context/session semantics |
-| Debate / competing hypotheses workflow | Documented as use case pattern | Dedicated `debate` mode with `add-debater` + `round` actions is implemented | Positive delta | Feature extension beyond official baseline tooling |
-| Cross-review prompt generation | Not a dedicated first-class command in official docs | Implemented in `round <project> cross-review` | Positive delta | Good specialized workflow |
+This document compares **team-tasks** (an OpenClaw skill) with **Claude Code's native Agent Teams** feature. Both solve multi-agent task coordination but in fundamentally different environments and with different tradeoffs.
 
-## Evidence Highlights
-- Official direct teammate messaging and mailbox features: `AGENT_TEAMS_OFFICIAL_DOCS.md:35`, `AGENT_TEAMS_OFFICIAL_DOCS.md:36`, `AGENT_TEAMS_OFFICIAL_DOCS.md:37`.
-- Official claim locking and dependency unblock semantics: `AGENT_TEAMS_OFFICIAL_DOCS.md:45`, `AGENT_TEAMS_OFFICIAL_DOCS.md:46`.
-- Official delegate/plan approval/hooks/display modes: `AGENT_TEAMS_OFFICIAL_DOCS.md:48`, `AGENT_TEAMS_OFFICIAL_DOCS.md:53`, `AGENT_TEAMS_OFFICIAL_DOCS.md:60`, `AGENT_TEAMS_OFFICIAL_DOCS.md:63`.
-- Current architecture is centralized by design: `SKILL.md:10`, `SKILL.md:11`.
-- Current implementation does include debate + workspace enhancements from spec: `scripts/task_manager.py:992`, `scripts/task_manager.py:995`, `scripts/task_manager.py:1007`, `scripts/task_manager.py:1013`, `scripts/task_manager.py:746`, `scripts/task_manager.py:708`.
-- Internal spec goals for debate/workspace: `SPEC.md:16`, `SPEC.md:57`.
+team-tasks runs inside OpenClaw (a self-hosted AI gateway). Claude Code Agent Teams run inside the `claude` CLI tool on a developer's local machine. They are **not direct competitors** — they serve different deployment contexts — but the comparison clarifies design decisions and feature gaps in each.
 
-## Honest Assessment
-`team-tasks` is a solid JSON-based orchestration layer for linear and DAG pipelines, and now includes a useful debate workflow. It is effective for AGI-centric dispatch where one coordinator drives all state transitions.
+---
 
-It is **not yet close to full parity** with official Claude Code Agent Teams runtime semantics. The biggest gaps are architectural: no teammate-to-teammate mailbox, no self-claim/locking model, and no delegate/approval/hooks governance features. In practical terms, this behaves more like a workflow/state manager than a true multi-agent team runtime.
+## Capability Comparison Matrix
 
-## Priority Gaps to Close (if parity is the goal)
-1. Add a first-class team/member runtime model with explicit lead + teammate identity and lifecycle.
-2. Implement mailbox primitives (`message`, `broadcast`, inbox/outbox) so teammates can coordinate directly.
-3. Add claim/release semantics with lock-safe updates to prevent race conditions.
-4. Add governance features: delegate mode restrictions, plan approval state machine, and completion/idle hooks.
-5. Align docs (`SKILL.md`) with actual capabilities (`debate`, `workspace`) to remove drift.
+| Capability | team-tasks (OpenClaw) | Claude Code Agent Teams |
+|---|---|---|
+| **Orchestration mode** | Linear / DAG / Debate | Parallel sub-agents |
+| **Task state persistence** | JSON file on disk | In-memory per session |
+| **State survives crash/restart** | ✅ Yes (JSON on disk) | ❌ No |
+| **Parallel dispatch** | ✅ DAG mode (`ready --json`) | ✅ Native |
+| **Dependency graph** | ✅ Full DAG with cycle detection | ❌ No DAG — flat parallel only |
+| **Agent dispatch mechanism** | `sessions_send` / `sessions_spawn` | `claude` sub-process spawn |
+| **Cross-session visibility** | Requires `tools.agentToAgent` + `visibility` config | Native (shared filesystem) |
+| **Progress tracking** | ✅ Per-task status + logs + output | ❌ No built-in tracking |
+| **Debate / deliberation mode** | ✅ Yes (positions → cross-review → synthesis) | ❌ No |
+| **Resume after failure** | ✅ `reset` command | ❌ Manual restart |
+| **Multi-agent on remote server** | ✅ Native (OpenClaw runs on VPS/server) | ⚠️ Local machine only |
+| **Channel integration** | ✅ Telegram/WhatsApp/Slack/etc. | ❌ Terminal only |
+| **Workspace sharing** | Via `--workspace` flag + shared path | Via `CLAUDE.md` + shared cwd |
+| **Token cost per task** | Low (CLI, no model calls) | High (each sub-agent = full context) |
+
+---
+
+## Key Gaps: team-tasks vs Claude Code Agent Teams
+
+### Where Claude Code Agent Teams wins
+
+**1. Zero-config sub-agent spawning**  
+Claude Code spawns sub-agents natively with `Task` tool calls — no JSON state files, no CLI setup, no `tools.allow` configuration required. The orchestrator just calls `Task(description="...", prompt="...")` and Claude handles the rest.
+
+**2. Shared filesystem as implicit state bus**  
+Sub-agents in Claude Code share the local filesystem by default. There is no need for explicit output passing — agents can read each other's files directly.
+
+**3. Tighter IDE integration**  
+Claude Code has native integration with VS Code and JetBrains. team-tasks is purely CLI-driven.
+
+---
+
+### Where team-tasks wins
+
+**1. Durable state across crashes and restarts**  
+All project state is stored as JSON on disk. If the orchestrator crashes mid-pipeline, the project state is preserved and the pipeline can resume with `next` or `ready`. Claude Code sub-agents have no equivalent durability.
+
+**2. DAG dependency graph with cycle detection**  
+team-tasks supports arbitrary task dependency graphs, parallel dispatch of all unblocked tasks simultaneously, and prevents circular dependencies at task creation time. Claude Code's `Task` tool is flat — all sub-agents are dispatched in parallel with no dependency ordering.
+
+**3. Debate mode**  
+The three-phase deliberation workflow (initial positions → cross-review → synthesis) has no equivalent in Claude Code.
+
+**4. Runs on remote servers + all chat channels**  
+team-tasks runs anywhere OpenClaw runs — a Debian VPS, a cloud server — and dispatches agents over Telegram, WhatsApp, Slack, etc. Claude Code is a local dev tool.
+
+**5. Low per-operation cost**  
+The CLI tool itself makes no model calls. Only the dispatched agents consume tokens. Claude Code's `Task` tool spins up a full sub-agent context per invocation.
+
+---
+
+## Critical OpenClaw Configuration Requirements
+
+The original version of this project documented `sessions_send` in `tools.allow` but omitted two other required configurations. **All three are needed** for team-tasks to work correctly:
+
+### 1. `tools.agentToAgent` — Cross-agent targeting (REQUIRED)
+
+Cross-agent `sessions_send` is **disabled by default**. Without this, `sessions_send` to another agent's session key will silently fail or be blocked.
+
+```json
+{
+  "tools": {
+    "agentToAgent": {
+      "enabled": true,
+      "allow": ["code-agent", "test-agent", "docs-agent", "monitor-bot"]
+    }
+  }
+}
+```
+
+Reference: https://docs.openclaw.ai/gateway/configuration-reference — `tools.agentToAgent`
+
+### 2. `tools.sessions.visibility` — Session scope (REQUIRED for cross-agent)
+
+Default is `"tree"` (only current session + spawned subagent sessions visible). team-tasks orchestrates **separately configured agents**, not spawned subagents, so the visibility must be widened:
+
+```json
+{
+  "tools": {
+    "sessions": {
+      "visibility": "agent"
+    }
+  }
+}
+```
+
+Options: `self` | `tree` | `agent` | `all`. Use `"agent"` to allow the orchestrator to see all sessions belonging to its own agent ID.
+
+Reference: https://docs.openclaw.ai/concepts/session-tool
+
+### 3. `tools.allow` for the orchestrator agent
+
+Use the `group:sessions` shorthand (available since OpenClaw v2026):
+
+```json
+{
+  "agents": {
+    "list": [{
+      "id": "orchestrator-agent",
+      "tools": {
+        "allow": ["group:sessions", "exec", "read"]
+      }
+    }]
+  }
+}
+```
+
+`group:sessions` expands to: `sessions_list, sessions_history, sessions_send, sessions_spawn, session_status`.
+
+Reference: https://docs.openclaw.ai/tools/multi-agent-sandbox-tools — Tool groups
+
+---
+
+## sessions_send vs sessions_spawn — Which to use?
+
+team-tasks currently uses `sessions_send` for all dispatch. Here is when to use each:
+
+| Tool | Blocking? | Best for |
+|---|---|---|
+| `sessions_send` | ✅ Blocking (waits for reply) | Linear mode — dispatch one agent, wait for result, then proceed |
+| `sessions_spawn` | ❌ Non-blocking (returns immediately) | DAG mode — dispatch multiple agents in parallel, collect results asynchronously |
+
+For **DAG mode**, `sessions_spawn` is more efficient: dispatch all `ready` tasks simultaneously, then collect results as each announces completion. `sessions_send` with a high `timeoutSeconds` also works but ties up the orchestrator context.
+
+```
+# Linear dispatch — sessions_send is correct
+sessions_send(sessionKey="agent:code-agent:main", message=task, timeoutSeconds=300)
+
+# DAG parallel dispatch — sessions_spawn is more efficient
+sessions_spawn(task=task_desc, agentId="code-agent", label="implement-api")
+sessions_spawn(task=task_desc, agentId="test-agent", label="write-tests")
+# Both run in parallel; collect via announce callbacks
+```
+
+Reference: https://docs.openclaw.ai/tools/subagents
+
+---
+
+## Credential Isolation Warning
+
+Each agent in OpenClaw has its own isolated auth store at `~/.openclaw/agents/<agentId>/agent/auth-profiles.json`. **Credentials are not shared between agents.** Worker agents (code-agent, test-agent, etc.) must each be authenticated separately. Never reuse `agentDir` across agents.
+
+Reference: https://docs.openclaw.ai/tools/multi-agent-sandbox-tools
+
+---
+
+## Summary
+
+team-tasks fills real gaps that Claude Code Agent Teams does not address: durable state, DAG dependencies, debate mode, and remote/channel-based deployment. The main area where Claude Code wins is zero-configuration simplicity for local development workflows.
+
+For production multi-agent pipelines that need to survive restarts, track progress across many tasks, or run on a remote server with chat channel integration, team-tasks provides capabilities Claude Code does not offer.
