@@ -1,294 +1,312 @@
 ---
 name: team-tasks
-description: "Coordinate multi-agent development pipelines using shared JSON task files. Use when dispatching work across dev team agents (code-agent, test-agent, docs-agent, monitor-bot), tracking pipeline progress, or running sequential/parallel workflows. Covers project init, task assignment, status tracking, agent dispatch via sessions_send, and result collection. Supports two modes: linear (sequential pipeline) and dag (dependency graph with parallel execution)."
+description: Multi-agent pipeline coordination with Linear, DAG, and Debate modes. Use to orchestrate sequential pipelines, parallel dependency graphs, or multi-agent deliberation workflows via a shared JSON task store.
+user-invocable: false
+metadata: {"openclaw":{"requires":{"bins":["python3"],"config":["tools.sessions.visibility"]},"emoji":"🗂️","os":["linux","darwin"]}}
 ---
 
 # Team Tasks — Multi-Agent Pipeline Coordination
 
 ## Overview
 
-Coordinate dev team agents through shared JSON task files + AGI dispatch.
-AGI is the command center — agents never talk to each other directly.
+This skill coordinates multi-agent development workflows through shared JSON task files.
+The CLI tool lives at: `{baseDir}/scripts/task_manager.py`
 
-**Two modes:**
-- **Mode A (linear):** Fixed pipeline order `code → test → docs → monitor`
-- **Mode B (dag):** Tasks declare dependencies, parallel dispatch when deps are met
+**AGI is the command center.** Worker agents do not communicate directly with each other.
+All state is shared via JSON files. AGI dispatches via `sessions_send`, tracks state via this CLI.
 
-## Task Manager CLI
+### ⚙️ Prerequisites (verify before use)
 
-All commands use: `python3 <skill-dir>/scripts/task_manager.py <command> [args]`
+1. **Python 3.12+** must be on PATH — the `metadata.requires.bins` gate checks for `python3`.
+2. **sessions_send** must be enabled in your `openclaw.json` for the orchestrating agent:
+   ```json
+   {
+     "agents": {
+       "list": [{
+         "id": "your-agent-id",
+         "tools": {
+           "allow": ["sessions_send", "sessions_list", "sessions_history", "session_status", "exec", "read"]
+         }
+       }]
+     }
+   }
+   ```
+3. **Data directory** is controlled by env var `TEAM_TASKS_DIR`.
+   Default when unset: `~/.openclaw/data/team-tasks/`
+   Override in your `openclaw.json`:
+   ```json
+   {
+     "skills": {
+       "entries": {
+         "team-tasks": {
+           "enabled": true,
+           "env": {
+             "TEAM_TASKS_DIR": "/home/reyan/.openclaw/data/team-tasks"
+           }
+         }
+       }
+     }
+   }
+   ```
+   The script respects this env var automatically — no hardcoded paths.
 
-Where `<skill-dir>` is the directory containing this SKILL.md.
+---
 
-### Quick Reference
+## Invoking the CLI
 
-| Command | Mode | Usage | Description |
-|---------|------|-------|-------------|
-| `init` | both | `init <project> -g "goal" [-m linear\|dag]` | Create project |
-| `add` | dag | `add <project> <task-id> -a <agent> -d <deps>` | Add task with deps |
-| `status` | both | `status <project> [--json]` | Show progress |
-| `assign` | both | `assign <project> <task> "desc"` | Set task description |
-| `update` | both | `update <project> <task> <status>` | Change status |
-| `next` | linear | `next <project> [--json]` | Get next stage |
-| `ready` | dag | `ready <project> [--json]` | Get all dispatchable tasks |
-| `graph` | dag | `graph <project>` | Show dependency tree |
-| `log` | both | `log <project> <task> "msg"` | Add log entry |
-| `result` | both | `result <project> <task> "output"` | Save output |
-| `reset` | both | `reset <project> [task] [--all]` | Reset to pending |
-| `list` | both | `list` | List all projects |
+Always use the full `{baseDir}`-relative path:
+
+```bash
+python3 {baseDir}/scripts/task_manager.py <command> [args]
+```
+
+Alias for brevity in this document:
+```
+TM="python3 {baseDir}/scripts/task_manager.py"
+```
+
+---
+
+## Mode A — Linear Pipeline
+
+Sequential pipeline. Agents execute one after another in order.
+**Use for:** bug fixes, simple features, step-by-step workflows.
+
+### Setup
+
+```bash
+# 1. Create project with pipeline order
+$TM init my-api \
+  --goal "Build REST API with tests and docs" \
+  --pipeline "code-agent,test-agent,docs-agent,monitor-bot"
+
+# 2. Assign task descriptions to each stage
+$TM assign my-api code-agent "Implement Flask REST API: GET/POST/DELETE /items"
+$TM assign my-api test-agent "Write pytest tests, target 90%+ coverage"
+$TM assign my-api docs-agent "Write README with API docs and examples"
+$TM assign my-api monitor-bot "Security audit and deployment readiness check"
+```
+
+### Dispatch Loop (repeat until done)
+
+```bash
+# 1. Get next stage
+NEXT=$($TM next my-api --json)
+# → { "stage": "code-agent", "task": "Implement Flask REST API..." }
+
+# 2. Mark in-progress
+$TM update my-api code-agent in-progress
+
+# 3. Dispatch to worker agent via sessions_send
+#    Include the task description and any prior stage outputs
+sessions_send(sessionKey="agent:code-agent:main", message="<task>", timeoutSeconds=120)
+
+# 4. Save output and mark done (auto-advances to next stage)
+$TM result my-api code-agent "<agent reply summary>"
+$TM update my-api code-agent done
+# ▶️  Next: test-agent  ← auto-advance confirmed
+```
+
+### Status Check
+
+```bash
+$TM status my-api
+# 📋 Project: my-api
+# 🎯 Goal: Build REST API with tests and docs
+# 📊 Status: active  |  Mode: linear
+# ▶️  Current: test-agent
+#
+#   ✅ code-agent: done
+#      Output: Created app.py with 3 endpoints
+#   🔄 test-agent: in-progress
+#   ⬜ docs-agent: pending
+#   ⬜ monitor-bot: pending
+#
+#   Progress: [██░░] 2/4
+```
+
+---
+
+## Mode B — DAG (Dependency Graph)
+
+Tasks declare dependencies; ready tasks are dispatched **in parallel** when deps complete.
+**Use for:** large features, spec-driven dev, complex parallel workstreams.
+
+### Setup
+
+```bash
+# 1. Create DAG project
+$TM init my-feature --mode dag \
+  --goal "Build search feature with parallel workstreams"
+
+# 2. Add tasks — dependencies must be added BEFORE they are referenced
+$TM add my-feature design      -a docs-agent  --desc "Write API spec"
+$TM add my-feature scaffold    -a code-agent  --desc "Create project skeleton"
+$TM add my-feature implement   -a code-agent  -d "design,scaffold" --desc "Implement API"
+$TM add my-feature write-tests -a test-agent  -d "design"          --desc "Write test cases from spec"
+$TM add my-feature run-tests   -a test-agent  -d "implement,write-tests" --desc "Run all tests"
+$TM add my-feature write-docs  -a docs-agent  -d "implement"             --desc "Write final docs"
+$TM add my-feature review      -a monitor-bot -d "run-tests,write-docs"  --desc "Final review"
+
+# 3. Visualize dependency tree
+$TM graph my-feature
+```
+
+### Dispatch Loop (parallel)
+
+```bash
+# 1. Get ALL currently dispatchable tasks
+READY=$($TM ready my-feature --json)
+# → [{ "id": "design", "agent": "docs-agent" }, { "id": "scaffold", "agent": "code-agent" }]
+
+# 2. For EACH ready task — dispatch in parallel
+for task in $READY:
+  $TM update my-feature <task.id> in-progress
+  sessions_send(sessionKey="agent:<task.agent>:main",
+                message="Task: <task.desc>\nPrior outputs: <task.depOutputs>",
+                timeoutSeconds=180)
+
+# 3. On each agent reply:
+$TM result my-feature <task.id> "<agent reply>"
+$TM update my-feature <task.id> done
+# 🟢 Unblocked: <newly-unblocked tasks> ← check stdout
+
+# 4. Re-run $TM ready to pick up newly unblocked tasks
+# Repeat until all done
+```
+
+**Key DAG behaviours (verified):**
+- `ready --json` includes `depOutputs` field — pass prior stage results directly to agents.
+- Cycle detection runs on every `add` — circular deps are rejected immediately.
+- Partial failure: unrelated branches continue; only downstream tasks of a failed task block.
+
+---
+
+## Mode C — Debate (Multi-Agent Deliberation)
+
+Same question → multiple agents → positions → cross-review → synthesis.
+**Use for:** code reviews, architecture decisions, competing hypotheses.
+
+### ⚠️ Rules
+- Add **all** debaters **before** calling `round start`. Adding debaters after `round start` will error.
+
+### Setup & Full Flow
+
+```bash
+# 1. Create debate project
+$TM init security-review --mode debate \
+  --goal "Review auth module for security vulnerabilities"
+
+# 2. Add debaters with roles (ALL before round start)
+$TM add-debater security-review code-agent  --role "security expert focused on injection attacks"
+$TM add-debater security-review test-agent  --role "QA engineer focused on edge cases"
+$TM add-debater security-review monitor-bot --role "ops engineer focused on deployment risks"
+
+# 3. Start initial round — dispatch prompts to each debater
+$TM round security-review start
+# 🗣️  Debate Round 1 (initial) started
+
+# 4. Dispatch to each debater via sessions_send, collect positions
+$TM round security-review collect code-agent  "Found SQL injection in login()"
+$TM round security-review collect test-agent  "Missing input validation on email field"
+$TM round security-review collect monitor-bot "No rate limiting on auth endpoints"
+# ✅ Round 1 complete. Next: round security-review cross-review
+
+# 5. Generate cross-review prompts (each agent gets others' positions)
+$TM round security-review cross-review
+
+# 6. Dispatch cross-review prompts, collect reviews
+$TM round security-review collect code-agent  "Agree on validation. Rate limiting is critical."
+$TM round security-review collect test-agent  "SQL injection is most severe. Adding rate limit tests."
+$TM round security-review collect monitor-bot "Both findings valid. Recommending WAF layer."
+
+# 7. Synthesize — outputs all positions + cross-reviews for final synthesis
+$TM round security-review synthesize
+```
+
+---
+
+## CLI Reference
+
+| Command | Mode | Usage |
+|---------|------|-------|
+| `init` | all | `init <project> -g "goal" [-m linear\|dag\|debate] [-p "a,b,c"]` |
+| `add` | dag | `add <project> <task-id> -a <agent> [-d "dep1,dep2"] [--desc "..."]` |
+| `add-debater` | debate | `add-debater <project> <agent-id> [--role "..."]` |
+| `round` | debate | `round <project> start\|collect\|cross-review\|synthesize` |
+| `status` | all | `status <project> [--json]` |
+| `assign` | linear/dag | `assign <project> <stage> "desc"` |
+| `update` | linear/dag | `update <project> <stage> pending\|in-progress\|done\|failed\|skipped` |
+| `next` | linear | `next <project> [--json]` |
+| `ready` | dag | `ready <project> [--json]` |
+| `graph` | dag | `graph <project>` |
+| `result` | linear/dag | `result <project> <stage> "output"` |
+| `log` | linear/dag | `log <project> <stage> "msg"` |
+| `reset` | linear/dag | `reset <project> [stage] [--all]` |
+| `history` | linear/dag | `history <project> <stage>` |
+| `list` | all | `list` |
 
 ### Status Values
 
-- `pending` — waiting for dispatch
-- `in-progress` — agent is working
-- `done` — stage completed
-- `failed` — stage failed (pipeline blocks)
-- `skipped` — intentionally skipped
+| Value | Icon | Meaning |
+|-------|------|---------|
+| `pending` | ⬜ | Waiting for dispatch |
+| `in-progress` | 🔄 | Agent is working |
+| `done` | ✅ | Completed |
+| `failed` | ❌ | Failed — blocks downstream tasks |
+| `skipped` | ⏭️ | Intentionally skipped |
 
-## Pipeline Workflow (Mode A: Linear)
+---
 
-### Step 1: Initialize Project
+## Common Pitfalls
+
+### ❌ Linear: stage ID is the agent name, NOT a number
+```bash
+# WRONG — "stage '1' not found"
+$TM assign my-project 1 "Build API"
+
+# CORRECT
+$TM assign my-project code-agent "Build API"
+```
+
+### ❌ DAG: dependency must exist before being referenced
+```bash
+# WRONG — "dependency 'design' not found"
+$TM add my-project implement -a code-agent -d "design"
+
+# CORRECT — add deps first
+$TM add my-project design    -a docs-agent --desc "Write spec"
+$TM add my-project implement -a code-agent -d "design" --desc "Implement"
+```
+
+### ❌ Debate: cannot add debaters after round starts
+```bash
+# WRONG
+$TM round my-debate start
+$TM add-debater my-debate new-agent  # Error!
+
+# CORRECT — add all debaters before starting
+$TM add-debater my-debate agent-a
+$TM add-debater my-debate agent-b
+$TM round my-debate start
+```
+
+### ❌ sessions_send not in tools.allow
+If dispatching to worker agents silently fails, confirm `sessions_send` is in your agent's
+`tools.allow` list in `openclaw.json`. See Prerequisites above.
+
+---
+
+## Data Storage
+
+Project files are stored as JSON. Path resolution order:
+1. `TEAM_TASKS_DIR` environment variable (set via `skills.entries.team-tasks.env` in openclaw.json)
+2. Default fallback: `~/.openclaw/data/team-tasks/`
 
 ```bash
-python3 scripts/task_manager.py init my-project \
-  -g "Build a REST API with tests and docs" \
-  -p "code-agent,test-agent,docs-agent,monitor-bot"
+# Check current effective path
+echo ${TEAM_TASKS_DIR:-~/.openclaw/data/team-tasks}
+
+# List all projects
+$TM list
 ```
-
-Default pipeline order: `code-agent → test-agent → docs-agent → monitor-bot`
-
-### Step 2: Assign Tasks to All Stages
-
-```bash
-python3 scripts/task_manager.py assign my-project code-agent "Implement REST API with Flask: GET/POST/DELETE /items"
-python3 scripts/task_manager.py assign my-project test-agent "Write pytest tests for all endpoints, target 90%+ coverage"
-python3 scripts/task_manager.py assign my-project docs-agent "Write README.md with API docs, setup guide, examples"
-python3 scripts/task_manager.py assign my-project monitor-bot "Verify code quality, check for security issues, validate deployment readiness"
-```
-
-### Step 3: Dispatch Agents Sequentially
-
-For each stage, AGI follows this loop:
-
-```
-1. Check next stage:   task_manager.py next <project> --json
-2. Mark in-progress:   task_manager.py update <project> <agent> in-progress
-3. Dispatch agent:     sessions_send(sessionKey="agent:<agent>:telegram:group:<id>", message=<task>)
-4. Wait for reply      (sessions_send returns the agent's response)
-5. Save result:        task_manager.py result <project> <agent> "<summary>"
-6. Mark done:          task_manager.py update <project> <agent> done
-7. Repeat from 1       (currentStage auto-advances)
-```
-
-### Step 4: Handle Failures
-
-If an agent fails:
-```bash
-python3 scripts/task_manager.py update my-project code-agent failed
-python3 scripts/task_manager.py log my-project code-agent "Failed: syntax error in main.py"
-```
-
-To retry:
-```bash
-python3 scripts/task_manager.py reset my-project code-agent
-python3 scripts/task_manager.py update my-project code-agent in-progress
-# Re-dispatch...
-```
-
-### Step 5: Check Progress Anytime
-
-```bash
-python3 scripts/task_manager.py status my-project
-```
-
-Output:
-```
-📋 Project: my-project
-🎯 Goal: Build a REST API with tests and docs
-📊 Status: active
-▶️  Current: test-agent
-
-  ✅ code-agent: done
-     Task: Implement REST API with Flask
-     Output: Created /home/ubuntu/projects/my-project/app.py
-  🔄 test-agent: in-progress
-     Task: Write pytest tests for all endpoints
-  ⬜ docs-agent: pending
-  ⬜ monitor-bot: pending
-
-  Progress: [██░░] 2/4
-```
-
-## Agent Dispatch Details
-
-### Session Keys (Dev Team)
-
-| Agent | Session Key |
-|-------|-------------|
-| code-agent | `agent:code-agent:telegram:group:-5189558203` |
-| test-agent | `agent:test-agent:telegram:group:-5218382533` |
-| docs-agent | `agent:docs-agent:telegram:group:-5253138320` |
-| monitor-bot | `agent:monitor-bot:telegram:group:-5193935559` |
-
-### Dispatch Template
-
-When dispatching to an agent, include:
-1. **Project context** — what the project is about
-2. **Specific task** — what this agent should do
-3. **Working directory** — where to create/find files
-4. **Previous stage output** — if relevant (e.g., test-agent needs to know what code-agent built)
-
-Example dispatch message:
-```
-Project: my-project
-Goal: Build a REST API with tests and docs
-Your task: Write pytest tests for all endpoints in /home/ubuntu/projects/my-project/app.py
-Target: 90%+ coverage, test GET/POST/DELETE /items
-Working directory: /home/ubuntu/projects/my-project/
-Previous stage (code-agent) output: Created app.py with Flask REST API, 3 endpoints
-```
-
-### Delivery Context Fix
-
-⚠️ If an agent's session was first created via `sessions_send`, its `deliveryContext` is `webchat`, not `telegram`. Agent replies won't appear in the Telegram group.
-
-**Workaround**: After getting the agent's reply via `sessions_send`, use the `message` tool to relay key results to the group:
-```
-message(action="send", channel="telegram", target="-5189558203", message="✅ code-agent 完成: Created app.py")
-```
-
-## Mode B: DAG Workflow (Parallel Dependencies)
-
-### Step 1: Initialize DAG Project
-
-```bash
-python3 scripts/task_manager.py init my-project -m dag -g "Build REST API with parallel workstreams"
-```
-
-### Step 2: Add Tasks with Dependencies
-
-```bash
-TM="python3 scripts/task_manager.py"
-# Root tasks (no deps — can run in parallel)
-$TM add my-project design     -a docs-agent  --desc "Write API spec"
-$TM add my-project scaffold   -a code-agent  --desc "Create project skeleton"
-
-# Tasks with dependencies (blocked until deps are done)
-$TM add my-project implement  -a code-agent  -d "design,scaffold" --desc "Implement API"
-$TM add my-project write-tests -a test-agent -d "design"          --desc "Write test cases from spec"
-
-# Fan-in: depends on multiple tasks
-$TM add my-project run-tests  -a test-agent  -d "implement,write-tests" --desc "Run all tests"
-$TM add my-project write-docs -a docs-agent  -d "implement"             --desc "Write final docs"
-
-# Final gate
-$TM add my-project review     -a monitor-bot -d "run-tests,write-docs"  --desc "Final review"
-```
-
-### Step 3: View DAG Graph
-
-```bash
-$TM graph my-project
-```
-```
-├─ ⬜ design [docs-agent]
-│  ├─ ⬜ implement [code-agent]
-│  │  ├─ ⬜ run-tests [test-agent]
-│  │  │  └─ ⬜ review [monitor-bot]
-│  │  └─ ⬜ write-docs [docs-agent]
-│  └─ ⬜ write-tests [test-agent]
-└─ ⬜ scaffold [code-agent]
-   └─ ⬜ implement (↑ see above)
-```
-
-### Step 4: Dispatch Ready Tasks
-
-```bash
-$TM ready my-project    # Shows all tasks whose deps are met
-```
-
-For each ready task, AGI follows this loop:
-```
-1. Get ready tasks:     task_manager.py ready <project> --json
-2. For each ready task (can dispatch in parallel):
-   a. Mark in-progress: task_manager.py update <project> <task> in-progress
-   b. Dispatch agent:   sessions_send(sessionKey=..., message=<task + dep outputs>)
-3. When agent replies:
-   a. Save result:      task_manager.py result <project> <task> "<summary>"
-   b. Mark done:        task_manager.py update <project> <task> done
-   c. Check newly unblocked tasks (printed automatically)
-4. Repeat until all done
-```
-
-### Key DAG Features
-
-- **Parallel dispatch**: `ready` returns ALL tasks whose deps are satisfied — dispatch them simultaneously
-- **Dep outputs forwarding**: `ready --json` includes `depOutputs` — previous stage results to pass to agents
-- **Auto-unblock notification**: When a task completes, shows which tasks are newly unblocked
-- **Cycle detection**: `add` rejects tasks that would create circular dependencies
-- **Partial failure**: If one task fails, unrelated branches continue; only downstream tasks block
-- **Graph visualization**: `graph` shows tree view with status icons and dedup markers
-
-## Custom Pipelines
-
-### Linear (Mode A)
-```bash
-# Code + test only
-python3 scripts/task_manager.py init quick-fix -g "Hotfix" -p "code-agent,test-agent"
-
-# Docs first, then code
-python3 scripts/task_manager.py init spec-driven -g "Spec-driven dev" -p "docs-agent,code-agent,test-agent"
-```
-
-### DAG (Mode B)
-```bash
-# Diamond pattern: 2 parallel branches merge for review
-$TM init diamond -m dag -g "Parallel dev"
-$TM add diamond code -a code-agent --desc "Write code"
-$TM add diamond test -a test-agent --desc "Write tests"
-$TM add diamond integrate -a code-agent -d "code,test" --desc "Integration"
-$TM add diamond review -a monitor-bot -d "integrate" --desc "Final review"
-```
-
-## Choosing Between Modes
-
-| | Mode A (linear) | Mode B (dag) |
-|---|---|---|
-| **When** | Sequential tasks, simple flows | Parallel workstreams, complex deps |
-| **Dispatch** | One at a time, auto-advance | Multiple simultaneous, dep-driven |
-| **Setup** | `init -p agents` (one command) | `init -m dag` + `add` per task |
-| **Best for** | Bug fixes, simple features | Large features, spec-driven dev |
-
-## Data Location
-
-Task files: `/home/ubuntu/clawd/data/team-tasks/<project>.json`
-
-## ⚠️ Common Pitfalls
-
-### Mode A: Stage ID is agent name, NOT a number
-In linear mode, the stage ID is the **agent name** (e.g., `code-agent`), not a numeric index like `1`, `2`, `3`.
-
-```bash
-# ❌ WRONG — will error "stage '1' not found"
-python3 scripts/task_manager.py assign my-project 1 "Build API"
-python3 scripts/task_manager.py update my-project 1 done
-
-# ✅ CORRECT — use agent name as stage ID
-python3 scripts/task_manager.py assign my-project code-agent "Build API"
-python3 scripts/task_manager.py update my-project code-agent done
-python3 scripts/task_manager.py result my-project code-agent "Created main.py"
-```
-
-This applies to all stage-referencing commands: `assign`, `update`, `result`, `log`, `reset`.
-
-The pipeline order is defined by `-p` at `init` time (e.g., `-p "code-agent,test-agent,docs-agent"`), and `next` automatically advances through them in order — but you always reference stages by agent name.
-
-## Tips
-
-- **One project per task** — keep scope focused; create multiple projects for parallel work
-- **Meaningful project slugs** — `rest-api-v2`, `bug-fix-auth`, `refactor-db` (not `project1`)
-- **Save results** — always `result` before `update done`; this is the inter-agent context
-- **Log liberally** — `log` is cheap; helps debug failed pipelines
-- **Reset and retry** — `reset --all` for clean reruns; `reset <stage>` for targeted retry
-- **DAG fan-out** — one root task can unblock many parallel tasks
-- **DAG fan-in** — a task can depend on multiple predecessors (all must complete)
